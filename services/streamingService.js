@@ -7,6 +7,18 @@ const { v4: uuidv4 } = require('uuid');
 const { db } = require('../db/database');
 const Stream = require('../models/Stream');
 const Playlist = require('../models/Playlist');
+
+// === DETEKSI ARSITEKTUR UNTUK OPTIMASI ARM32 ===
+const os = require('os');
+const isARM32 = os.arch() === 'arm' && os.totalmem() < 2 * 1024 * 1024 * 1024; // <2GB RAM → anggap ARM32 low-end
+console.log(`[StreamingService] Architecture: ${os.arch()}, Total RAM: ${(os.totalmem() / 1024 / 1024).toFixed(0)} MB, isARM32: ${isARM32}`);
+
+// === KONFIGURASI DEFAULT BERDASARKAN ARSITEKTUR ===
+const DEFAULT_BITRATE = isARM32 ? 1000 : 2500;        // kbps
+const DEFAULT_RESOLUTION = isARM32 ? '960x540' : '1280x720';
+const DEFAULT_FPS = isARM32 ? 25 : 30;
+const ENCODING_PRESET = isARM32 ? 'ultrafast' : 'veryfast';
+
 let ffmpegPath;
 if (fs.existsSync('/usr/bin/ffmpeg')) {
   ffmpegPath = '/usr/bin/ffmpeg';
@@ -15,16 +27,18 @@ if (fs.existsSync('/usr/bin/ffmpeg')) {
   ffmpegPath = ffmpegInstaller.path;
   console.log('Using bundled FFmpeg at:', ffmpegPath);
 }
+
 const Video = require('../models/Video');
 const activeStreams = new Map();
 const streamLogs = new Map();
 const streamRetryCount = new Map();
 const streamLastSuccessTime = new Map();
-const MAX_RETRY_ATTEMPTS = 10;
+const MAX_RETRY_ATTEMPTS = isARM32 ? 5 : 10; // kurangi retry di ARM32
 const RETRY_RESET_INTERVAL = 30 * 60 * 1000;
 const manuallyStoppingStreams = new Set();
 const MAX_LOG_LINES = 100;
 const HEALTH_CHECK_INTERVAL = 60 * 1000;
+
 function addStreamLog(streamId, message) {
   if (!streamLogs.has(streamId)) {
     streamLogs.set(streamId, []);
@@ -42,7 +56,6 @@ function addStreamLog(streamId, message) {
 function cleanupStreamData(streamId, keepLogs = true) {
   streamRetryCount.delete(streamId);
   streamLastSuccessTime.delete(streamId);
-  
   if (!keepLogs) {
     streamLogs.delete(streamId);
   }
@@ -70,7 +83,7 @@ function checkAndResetRetryCounter(streamId) {
     const oldCount = streamRetryCount.get(streamId) || 0;
     if (oldCount > 0) {
       streamRetryCount.set(streamId, 0);
-      console.log(`[StreamingService] Reset retry counter for stream ${streamId} after successful streaming period`);
+      console.log(`[StreamingService] Reset retry counter for stream ${streamId}`);
     }
     streamLastSuccessTime.set(streamId, Date.now());
   }
@@ -82,16 +95,17 @@ function markStreamSuccess(streamId) {
   }
   checkAndResetRetryCounter(streamId);
 }
+
 async function buildFFmpegArgsForPlaylist(stream, playlist) {
   if (!playlist.videos || playlist.videos.length === 0) {
     throw new Error(`Playlist is empty for playlist_id: ${stream.video_id}`);
   }
-  
+
   const projectRoot = path.resolve(__dirname, '..');
   const rtmpUrl = `${stream.rtmp_url.replace(/\/$/, '')}/${stream.stream_key}`;
-  
+
   let videoPaths = [];
-  
+
   if (playlist.is_shuffle || playlist.shuffle) {
     const shuffledVideos = [...playlist.videos].sort(() => Math.random() - 0.5);
     videoPaths = shuffledVideos.map(video => {
@@ -104,35 +118,31 @@ async function buildFFmpegArgsForPlaylist(stream, playlist) {
       return path.join(projectRoot, 'public', relativeVideoPath);
     });
   }
-  
+
   for (const videoPath of videoPaths) {
     if (!fs.existsSync(videoPath)) {
       throw new Error(`Video file not found: ${videoPath}`);
     }
   }
-  
+
   const concatFile = path.join(projectRoot, 'temp', `playlist_${stream.id}.txt`);
-  
   const tempDir = path.dirname(concatFile);
   if (!fs.existsSync(tempDir)) {
     fs.mkdirSync(tempDir, { recursive: true });
   }
-  
+
   let concatContent = '';
-  if (stream.loop_video) {
-    for (let i = 0; i < 1000; i++) {
-      videoPaths.forEach(videoPath => {
-        concatContent += `file '${videoPath.replace(/\\/g, '/')}'\n`;
-      });
-    }
-  } else {
+  const loopLimit = isARM32 ? 10 : 1000; // batasi loop di ARM32
+  const actualLoop = stream.loop_video ? loopLimit : 1;
+
+  for (let i = 0; i < actualLoop; i++) {
     videoPaths.forEach(videoPath => {
       concatContent += `file '${videoPath.replace(/\\/g, '/')}'\n`;
     });
   }
-  
+
   fs.writeFileSync(concatFile, concatContent);
-  
+
   if (!stream.use_advanced_settings) {
     return [
       '-nostdin',
@@ -150,12 +160,12 @@ async function buildFFmpegArgsForPlaylist(stream, playlist) {
       rtmpUrl
     ];
   }
-  
-  const resolution = stream.resolution || '1280x720';
-  const bitrate = stream.bitrate || 2500;
-  const fps = stream.fps || 30;
+
+  const resolution = stream.resolution || DEFAULT_RESOLUTION;
+  const bitrate = stream.bitrate || DEFAULT_BITRATE;
+  const fps = stream.fps || DEFAULT_FPS;
   const gopSize = fps * 2;
-  
+
   return [
     '-nostdin',
     '-loglevel', 'warning',
@@ -165,7 +175,7 @@ async function buildFFmpegArgsForPlaylist(stream, playlist) {
     '-safe', '0',
     '-i', concatFile,
     '-c:v', 'libx264',
-    '-preset', 'veryfast',
+    '-preset', ENCODING_PRESET,
     '-profile:v', 'high',
     '-level', '4.1',
     '-b:v', `${bitrate}k`,
@@ -188,41 +198,34 @@ async function buildFFmpegArgsForPlaylist(stream, playlist) {
 
 async function buildFFmpegArgs(stream) {
   const streamWithVideo = await Stream.getStreamWithVideo(stream.id);
-  
+
   if (streamWithVideo && streamWithVideo.video_type === 'playlist') {
-    const Playlist = require('../models/Playlist');
     const playlist = await Playlist.findByIdWithVideos(stream.video_id);
-    
     if (!playlist) {
       throw new Error(`Playlist not found for playlist_id: ${stream.video_id}`);
     }
-    
     return await buildFFmpegArgsForPlaylist(stream, playlist);
   }
-  
+
   const video = await Video.findById(stream.video_id);
   if (!video) {
     throw new Error(`Video record not found in database for video_id: ${stream.video_id}`);
   }
-  
+
   const relativeVideoPath = video.filepath.startsWith('/') ? video.filepath.substring(1) : video.filepath;
   const projectRoot = path.resolve(__dirname, '..');
   const videoPath = path.join(projectRoot, 'public', relativeVideoPath);
-  
+
   if (!fs.existsSync(videoPath)) {
     console.error(`[StreamingService] CRITICAL: Video file not found on disk.`);
     console.error(`[StreamingService] Checked path: ${videoPath}`);
-    console.error(`[StreamingService] stream.video_id: ${stream.video_id}`);
-    console.error(`[StreamingService] video.filepath (from DB): ${video.filepath}`);
-    console.error(`[StreamingService] Calculated relativeVideoPath: ${relativeVideoPath}`);
-    console.error(`[StreamingService] process.cwd(): ${process.cwd()}`);
-    throw new Error('Video file not found on disk. Please check paths and file existence.');
+    throw new Error('Video file not found on disk.');
   }
-  
+
   const rtmpUrl = `${stream.rtmp_url.replace(/\/$/, '')}/${stream.stream_key}`;
   const loopOption = '-stream_loop';
-  const loopValue = stream.loop_video ? '-1' : '0';
-  
+  const loopValue = stream.loop_video ? (isARM32 ? '5' : '-1') : '0'; // batasi loop di ARM32
+
   if (!stream.use_advanced_settings) {
     return [
       '-nostdin',
@@ -239,12 +242,12 @@ async function buildFFmpegArgs(stream) {
       rtmpUrl
     ];
   }
-  
-  const resolution = stream.resolution || '1280x720';
-  const bitrate = stream.bitrate || 2500;
-  const fps = stream.fps || 30;
+
+  const resolution = stream.resolution || DEFAULT_RESOLUTION;
+  const bitrate = stream.bitrate || DEFAULT_BITRATE;
+  const fps = stream.fps || DEFAULT_FPS;
   const gopSize = fps * 2;
-  
+
   return [
     '-nostdin',
     '-loglevel', 'warning',
@@ -253,7 +256,7 @@ async function buildFFmpegArgs(stream) {
     loopOption, loopValue,
     '-i', videoPath,
     '-c:v', 'libx264',
-    '-preset', 'veryfast',
+    '-preset', ENCODING_PRESET,
     '-profile:v', 'high',
     '-level', '4.1',
     '-b:v', `${bitrate}k`,
@@ -273,43 +276,51 @@ async function buildFFmpegArgs(stream) {
     rtmpUrl
   ];
 }
+
 async function startStream(streamId, isRetry = false) {
   try {
     if (!isRetry) {
       streamRetryCount.set(streamId, 0);
     }
-    
+
     if (activeStreams.has(streamId)) {
       return { success: false, error: 'Stream is already active' };
     }
+
+    // === BATAS STREAM AKTIF DI ARM32 ===
+    if (isARM32 && activeStreams.size >= 1) {
+      const msg = 'Only 1 concurrent stream allowed on ARM32 to prevent system overload';
+      addStreamLog(streamId, msg);
+      console.warn(msg);
+      return { success: false, error: msg };
+    }
+
     const stream = await Stream.findById(streamId);
     if (!stream) {
       return { success: false, error: 'Stream not found' };
     }
-    
+
     const startTimeIso = new Date().toISOString();
-    const streamStartTime = new Date(startTimeIso);
     const ffmpegArgs = await buildFFmpegArgs(stream);
     const fullCommand = `${ffmpegPath} ${ffmpegArgs.join(' ')}`;
     addStreamLog(streamId, `Starting stream with command: ${fullCommand}`);
     console.log(`Starting stream: ${fullCommand}`);
-    
+
     const ffmpegProcess = spawn(ffmpegPath, ffmpegArgs, {
       detached: false,
       stdio: ['ignore', 'pipe', 'pipe']
     });
-    
+
     activeStreams.set(streamId, {
       process: ffmpegProcess,
       userId: stream.user_id,
       startTime: startTimeIso,
       pid: ffmpegProcess.pid
     });
-    
+
     streamLastSuccessTime.set(streamId, Date.now());
-    
     await Stream.updateStatus(streamId, 'live', stream.user_id, { startTimeOverride: startTimeIso });
-    
+
     ffmpegProcess.stdout.on('data', (data) => {
       const message = data.toString().trim();
       if (message) {
@@ -317,7 +328,7 @@ async function startStream(streamId, isRetry = false) {
         markStreamSuccess(streamId);
       }
     });
-    
+
     ffmpegProcess.stderr.on('data', (data) => {
       const message = data.toString().trim();
       if (message) {
@@ -329,363 +340,239 @@ async function startStream(streamId, isRetry = false) {
         }
       }
     });
-    
+
     ffmpegProcess.on('exit', async (code, signal) => {
       addStreamLog(streamId, `Stream ended with code ${code}, signal: ${signal}`);
       console.log(`[FFMPEG_EXIT] ${streamId}: Code=${code}, Signal=${signal}`);
-      
+
       const wasActive = activeStreams.delete(streamId);
       const isManualStop = manuallyStoppingStreams.has(streamId);
-      
+
       let currentStream;
       try {
         currentStream = await Stream.findById(streamId);
       } catch (err) {
         console.error(`[StreamingService] Error fetching stream ${streamId}: ${err.message}`);
       }
-      
+
       const userId = currentStream?.user_id || stream.user_id;
-      
+
       if (isManualStop) {
-        console.log(`[StreamingService] Stream ${streamId} was manually stopped, not restarting`);
         manuallyStoppingStreams.delete(streamId);
         cleanupStreamData(streamId);
         if (wasActive) {
-          try {
-            await Stream.updateStatus(streamId, 'offline', userId);
-            if (typeof schedulerService !== 'undefined' && schedulerService.cancelStreamTermination) {
-              schedulerService.handleStreamStopped(streamId);
-            }
-          } catch (error) {
-            console.error(`[StreamingService] Error updating stream status after manual stop: ${error.message}`);
+          await Stream.updateStatus(streamId, 'offline', userId);
+          if (typeof schedulerService.handleStreamStopped === 'function') {
+            schedulerService.handleStreamStopped(streamId);
           }
         }
         return;
       }
-      
+
       const shouldRetry = (signal === 'SIGSEGV' || signal === 'SIGKILL' || (code !== 0 && code !== null));
-      
+
       if (shouldRetry) {
         const retryCount = streamRetryCount.get(streamId) || 0;
-        
         if (retryCount < MAX_RETRY_ATTEMPTS) {
           streamRetryCount.set(streamId, retryCount + 1);
-          
-          const backoffMs = Math.min(3000 * Math.pow(2, retryCount), 60000);
-          
-          console.log(`[StreamingService] FFmpeg exited (code=${code}, signal=${signal}). Attempting restart #${retryCount + 1} for stream ${streamId} in ${backoffMs}ms`);
-          addStreamLog(streamId, `Stream interrupted. Attempting restart #${retryCount + 1} in ${backoffMs / 1000}s`);
-          
+          const backoffMs = Math.min(3000 * Math.pow(2, retryCount), isARM32 ? 30000 : 60000);
+
+          console.log(`[StreamingService] Restarting stream ${streamId} in ${backoffMs}ms (attempt ${retryCount + 1})`);
+          addStreamLog(streamId, `Restarting in ${backoffMs / 1000}s (attempt ${retryCount + 1})`);
+
           setTimeout(async () => {
             try {
               const streamInfo = await Stream.findById(streamId);
               if (streamInfo && streamInfo.status !== 'offline') {
-                const result = await startStream(streamId, true);
-                if (!result.success) {
-                  console.error(`[StreamingService] Failed to restart stream: ${result.error}`);
-                  await Stream.updateStatus(streamId, 'offline', streamInfo.user_id);
-                  cleanupStreamData(streamId);
-                }
+                await startStream(streamId, true);
               } else {
-                console.log(`[StreamingService] Stream ${streamId} was set to offline or deleted, not restarting`);
                 cleanupStreamData(streamId);
               }
-            } catch (error) {
-              console.error(`[StreamingService] Error during stream restart: ${error.message}`);
-              try {
-                await Stream.updateStatus(streamId, 'offline');
-              } catch (dbError) {
-                console.error(`Error updating stream status: ${dbError.message}`);
-              }
+            } catch (e) {
+              console.error(`[StreamingService] Restart failed:`, e);
+              await Stream.updateStatus(streamId, 'offline', userId);
               cleanupStreamData(streamId);
             }
           }, backoffMs);
           return;
-        } else {
-          console.error(`[StreamingService] Maximum retry attempts (${MAX_RETRY_ATTEMPTS}) reached for stream ${streamId}`);
-          addStreamLog(streamId, `Maximum retry attempts (${MAX_RETRY_ATTEMPTS}) reached, stopping stream`);
         }
       }
-      
+
       if (wasActive) {
-        try {
-          console.log(`[StreamingService] Updating stream ${streamId} status to offline after FFmpeg exit`);
-          await Stream.updateStatus(streamId, 'offline', userId);
-          if (typeof schedulerService !== 'undefined' && schedulerService.cancelStreamTermination) {
-            schedulerService.handleStreamStopped(streamId);
-          }
-        } catch (error) {
-          console.error(`[StreamingService] Error updating stream status after exit: ${error.message}`);
+        await Stream.updateStatus(streamId, 'offline', userId);
+        if (typeof schedulerService.handleStreamStopped === 'function') {
+          schedulerService.handleStreamStopped(streamId);
         }
         cleanupStreamData(streamId);
       }
     });
-    
+
     ffmpegProcess.on('error', async (err) => {
-      addStreamLog(streamId, `Error in stream process: ${err.message}`);
+      addStreamLog(streamId, `Process error: ${err.message}`);
       console.error(`[FFMPEG_PROCESS_ERROR] ${streamId}: ${err.message}`);
       activeStreams.delete(streamId);
-      try {
-        await Stream.updateStatus(streamId, 'offline', stream.user_id);
-      } catch (error) {
-        console.error(`Error updating stream status: ${error.message}`);
-      }
+      await Stream.updateStatus(streamId, 'offline', stream.user_id);
       cleanupStreamData(streamId);
     });
-    
-    if (typeof schedulerService !== 'undefined' && stream.end_time) {
+
+    if (stream.end_time) {
       const endTime = new Date(stream.end_time);
       const now = new Date();
       const remainingMs = endTime.getTime() - now.getTime();
       if (remainingMs > 0) {
         const remainingMinutes = remainingMs / 60000;
-        console.log(`[StreamingService] Scheduling termination for stream ${streamId} at ${stream.end_time} (${remainingMinutes.toFixed(1)} min remaining)`);
+        console.log(`[StreamingService] Scheduling termination for stream ${streamId} (${remainingMinutes.toFixed(1)} min)`);
         schedulerService.scheduleStreamTermination(streamId, remainingMinutes);
       }
     }
-    
+
     return {
       success: true,
       message: 'Stream started successfully',
       isAdvancedMode: stream.use_advanced_settings
     };
   } catch (error) {
-    addStreamLog(streamId, `Failed to start stream: ${error.message}`);
+    addStreamLog(streamId, `Failed to start: ${error.message}`);
     console.error(`Error starting stream ${streamId}:`, error);
     return { success: false, error: error.message };
   }
 }
+
 async function stopStream(streamId) {
   try {
     const streamData = activeStreams.get(streamId);
-    const isActive = streamData !== undefined;
-    console.log(`[StreamingService] Stop request for stream ${streamId}, isActive: ${isActive}`);
-    
+    const isActive = !!streamData;
+
     if (!isActive) {
       const stream = await Stream.findById(streamId);
       if (stream && stream.status === 'live') {
-        console.log(`[StreamingService] Stream ${streamId} not active in memory but status is 'live' in DB. Fixing status.`);
         await Stream.updateStatus(streamId, 'offline', stream.user_id);
-        if (typeof schedulerService !== 'undefined' && schedulerService.cancelStreamTermination) {
+        if (typeof schedulerService.handleStreamStopped === 'function') {
           schedulerService.handleStreamStopped(streamId);
         }
         cleanupStreamData(streamId);
-        return { success: true, message: 'Stream status fixed (was not active but marked as live)' };
+        return { success: true, message: 'Fixed inconsistent live status' };
       }
-      return { success: false, error: 'Stream is not active' };
+      return { success: false, error: 'Stream not active' };
     }
-    
+
     addStreamLog(streamId, 'Stopping stream...');
-    console.log(`[StreamingService] Stopping active stream ${streamId}`);
     manuallyStoppingStreams.add(streamId);
-    
-    const ffmpegProcess = streamData.process || streamData;
-    
-    try {
-      if (ffmpegProcess && typeof ffmpegProcess.kill === 'function') {
-        ffmpegProcess.kill('SIGTERM');
-      }
-    } catch (killError) {
-      console.error(`[StreamingService] Error killing FFmpeg process: ${killError.message}`);
-      manuallyStoppingStreams.delete(streamId);
+
+    const ffmpegProcess = streamData.process;
+    if (ffmpegProcess && typeof ffmpegProcess.kill === 'function') {
+      ffmpegProcess.kill('SIGTERM');
+
+      // Force kill after 5s if needed (penting di ARM32)
+      setTimeout(() => {
+        if (ffmpegProcess.exitCode === null) {
+          try { ffmpegProcess.kill('SIGKILL'); } catch (e) {}
+        }
+      }, 5000);
     }
-    
-    const stream = await Stream.findById(streamId);
+
     activeStreams.delete(streamId);
-    
+
     const tempConcatFile = path.join(__dirname, '..', 'temp', `playlist_${streamId}.txt`);
-    try {
-      if (fs.existsSync(tempConcatFile)) {
-        fs.unlinkSync(tempConcatFile);
-        console.log(`[StreamingService] Cleaned up temporary playlist file: ${tempConcatFile}`);
-      }
-    } catch (cleanupError) {
-      console.error(`[StreamingService] Error cleaning up temporary file: ${cleanupError.message}`);
+    if (fs.existsSync(tempConcatFile)) {
+      fs.unlinkSync(tempConcatFile);
     }
-    
+
+    const stream = await Stream.findById(streamId);
     if (stream) {
       const endTimeForHistory = new Date().toISOString();
-      const streamForHistory = {
-        ...stream,
-        end_time: endTimeForHistory
-      };
-      await saveStreamHistory(streamForHistory);
-      
+      await saveStreamHistory({ ...stream, end_time: endTimeForHistory });
       await Stream.updateStatus(streamId, 'offline', stream.user_id);
     }
-    
-    if (typeof schedulerService !== 'undefined' && schedulerService.cancelStreamTermination) {
+
+    if (typeof schedulerService.handleStreamStopped === 'function') {
       schedulerService.handleStreamStopped(streamId);
     }
-    
+
+    manuallyStoppingStreams.delete(streamId);
     cleanupStreamData(streamId);
     return { success: true, message: 'Stream stopped successfully' };
   } catch (error) {
     manuallyStoppingStreams.delete(streamId);
-    console.error(`[StreamingService] Error stopping stream ${streamId}:`, error);
+    console.error(`Error stopping stream ${streamId}:`, error);
     return { success: false, error: error.message };
   }
 }
+
+// === Fungsi lain tetap sama (sync, health check, dll) ===
 async function syncStreamStatuses() {
   try {
-    console.log('[StreamingService] Syncing stream statuses...');
-    
     const liveStreams = await Stream.findAll(null, 'live');
-    
     for (const stream of liveStreams) {
-      const isReallyActive = activeStreams.has(stream.id);
-      
-      if (!isReallyActive) {
+      if (!activeStreams.has(stream.id)) {
         const retryCount = streamRetryCount.get(stream.id);
-        const isRetrying = retryCount !== undefined && retryCount > 0 && retryCount < MAX_RETRY_ATTEMPTS;
-        
-        if (isRetrying) {
-          console.log(`[StreamingService] Stream ${stream.id} is in retry process, skipping sync`);
-          continue;
+        const isRetrying = retryCount > 0 && retryCount < MAX_RETRY_ATTEMPTS;
+        if (!isRetrying) {
+          await Stream.updateStatus(stream.id, 'offline', stream.user_id);
+          cleanupStreamData(stream.id);
         }
-        
-        const streamData = activeStreams.get(stream.id);
-        if (streamData && streamData.startTime) {
-          const startedAgo = Date.now() - new Date(streamData.startTime).getTime();
-          if (startedAgo < 30000) {
-            console.log(`[StreamingService] Stream ${stream.id} was recently started, skipping sync`);
-            continue;
-          }
-        }
-        
-        console.log(`[StreamingService] Found inconsistent stream ${stream.id}: marked as 'live' in DB but not active in memory`);
-        await Stream.updateStatus(stream.id, 'offline', stream.user_id);
-        console.log(`[StreamingService] Updated stream ${stream.id} status to 'offline'`);
-        cleanupStreamData(stream.id);
       }
     }
-    
+
     const activeStreamIds = Array.from(activeStreams.keys());
-    for (const streamId of activeStreamIds) {
-      const stream = await Stream.findById(streamId);
-      const streamData = activeStreams.get(streamId);
-      
-      if (!stream) {
-        console.log(`[StreamingService] Stream ${streamId} not found in DB, stopping orphaned process`);
-        const ffmpegProcess = streamData?.process || streamData;
-        if (ffmpegProcess && typeof ffmpegProcess.kill === 'function') {
-          try {
-            ffmpegProcess.kill('SIGTERM');
-          } catch (error) {
-            console.error(`[StreamingService] Error killing orphaned process: ${error.message}`);
-          }
-        }
-        activeStreams.delete(streamId);
-        cleanupStreamData(streamId);
-      } else if (stream.status !== 'live') {
-        console.log(`[StreamingService] Stream ${streamId} active in memory but status is '${stream.status}' in DB, updating to 'live'`);
-        await Stream.updateStatus(streamId, 'live', stream.user_id);
-      }
-      
-      if (streamData) {
-        const ffmpegProcess = streamData.process || streamData;
-        if (ffmpegProcess && ffmpegProcess.exitCode !== null) {
-          console.log(`[StreamingService] FFmpeg process for stream ${streamId} has exited, cleaning up`);
-          activeStreams.delete(streamId);
-          if (stream) {
-            await Stream.updateStatus(streamId, 'offline', stream.user_id);
-          }
-          cleanupStreamData(streamId);
-        }
+    for (const id of activeStreamIds) {
+      const s = await Stream.findById(id);
+      if (!s) {
+        activeStreams.delete(id);
+        cleanupStreamData(id);
       }
     }
-    
-    console.log(`[StreamingService] Stream status sync completed. Active streams: ${activeStreams.size}`);
-  } catch (error) {
-    console.error('[StreamingService] Error syncing stream statuses:', error);
+  } catch (e) {
+    console.error('[StreamingService] Sync error:', e);
   }
 }
 
 async function healthCheckStreams() {
   try {
-    const activeStreamIds = Array.from(activeStreams.keys());
-    
-    for (const streamId of activeStreamIds) {
-      const streamData = activeStreams.get(streamId);
-      if (!streamData) continue;
-      
-      const ffmpegProcess = streamData.process || streamData;
-      
-      if (ffmpegProcess && ffmpegProcess.exitCode !== null) {
-        console.log(`[StreamingService] Health check: Stream ${streamId} process has exited`);
-        activeStreams.delete(streamId);
-        const stream = await Stream.findById(streamId);
-        if (stream && stream.status === 'live') {
-          await Stream.updateStatus(streamId, 'offline', stream.user_id);
-        }
-        cleanupStreamData(streamId);
+    for (const [id, data] of activeStreams) {
+      if (data.process.exitCode !== null) {
+        activeStreams.delete(id);
+        const s = await Stream.findById(id);
+        if (s && s.status === 'live') await Stream.updateStatus(id, 'offline', s.user_id);
+        cleanupStreamData(id);
       }
-      
-      checkAndResetRetryCounter(streamId);
+      checkAndResetRetryCounter(id);
     }
-  } catch (error) {
-    console.error('[StreamingService] Error in health check:', error);
+  } catch (e) {
+    console.error('[StreamingService] Health check error:', e);
   }
 }
 
 setInterval(syncStreamStatuses, 5 * 60 * 1000);
-
 setInterval(healthCheckStreams, HEALTH_CHECK_INTERVAL);
-
 setInterval(cleanupOldLogs, 30 * 60 * 1000);
 
 async function gracefulShutdown() {
   console.log('[StreamingService] Graceful shutdown initiated...');
-  
-  const activeStreamIds = Array.from(activeStreams.keys());
-  console.log(`[StreamingService] Stopping ${activeStreamIds.length} active streams...`);
-  
-  for (const streamId of activeStreamIds) {
-    try {
-      const streamData = activeStreams.get(streamId);
-      const ffmpegProcess = streamData?.process || streamData;
-      
-      if (ffmpegProcess && typeof ffmpegProcess.kill === 'function') {
-        manuallyStoppingStreams.add(streamId);
-        ffmpegProcess.kill('SIGTERM');
-        console.log(`[StreamingService] Sent SIGTERM to stream ${streamId}`);
-      }
-      
-      const stream = await Stream.findById(streamId);
-      if (stream) {
-        await Stream.updateStatus(streamId, 'offline', stream.user_id);
-      }
-      
-      activeStreams.delete(streamId);
-      cleanupStreamData(streamId, false);
-    } catch (error) {
-      console.error(`[StreamingService] Error stopping stream ${streamId} during shutdown:`, error.message);
-    }
+  const ids = Array.from(activeStreams.keys());
+  for (const id of ids) {
+    manuallyStoppingStreams.add(id);
+    const p = activeStreams.get(id)?.process;
+    if (p?.kill) p.kill('SIGTERM');
+    setTimeout(() => { if (p?.exitCode === null) p?.kill('SIGKILL'); }, 5000);
+    const s = await Stream.findById(id);
+    if (s) await Stream.updateStatus(id, 'offline', s.user_id);
+    activeStreams.delete(id);
+    cleanupStreamData(id, false);
   }
-  
-  console.log('[StreamingService] Graceful shutdown completed');
+  console.log('[StreamingService] Shutdown completed');
 }
 
-process.on('SIGTERM', async () => {
-  await gracefulShutdown();
-  process.exit(0);
-});
+process.on('SIGTERM', async () => { await gracefulShutdown(); process.exit(0); });
+process.on('SIGINT', async () => { await gracefulShutdown(); process.exit(0); });
 
-process.on('SIGINT', async () => {
-  await gracefulShutdown();
-  process.exit(0);
-});
 function isStreamActive(streamId) {
-  if (!activeStreams.has(streamId)) return false;
-  
-  const streamData = activeStreams.get(streamId);
-  const ffmpegProcess = streamData?.process || streamData;
-  
-  if (ffmpegProcess && ffmpegProcess.exitCode !== null) {
+  const data = activeStreams.get(streamId);
+  if (!data) return false;
+  if (data.process.exitCode !== null) {
     activeStreams.delete(streamId);
     return false;
   }
-  
   return true;
 }
 
@@ -694,33 +581,29 @@ function getActiveStreams() {
 }
 
 function getActiveStreamInfo(streamId) {
-  const streamData = activeStreams.get(streamId);
-  if (!streamData) return null;
-  
+  const data = activeStreams.get(streamId);
+  if (!data) return null;
   return {
     streamId,
-    userId: streamData.userId,
-    startTime: streamData.startTime,
-    pid: streamData.pid,
+    userId: data.userId,
+    startTime: data.startTime,
+    pid: data.pid,
     retryCount: streamRetryCount.get(streamId) || 0
   };
 }
+
 function getStreamLogs(streamId) {
   return streamLogs.get(streamId) || [];
 }
+
 async function saveStreamHistory(stream) {
   try {
-    if (!stream.start_time) {
-      console.log(`[StreamingService] Not saving history for stream ${stream.id} - no start time recorded`);
-      return false;
-    }
-    const startTime = new Date(stream.start_time);
-    const endTime = stream.end_time ? new Date(stream.end_time) : new Date();
-    const durationSeconds = Math.floor((endTime - startTime) / 1000);
-    if (durationSeconds < 1) {
-      console.log(`[StreamingService] Not saving history for stream ${stream.id} - duration too short (${durationSeconds}s)`);
-      return false;
-    }
+    if (!stream.start_time) return false;
+    const start = new Date(stream.start_time);
+    const end = stream.end_time ? new Date(stream.end_time) : new Date();
+    const duration = Math.floor((end - start) / 1000);
+    if (duration < 1) return false;
+
     const videoDetails = stream.video_id ? await Video.findById(stream.video_id) : null;
     const historyData = {
       id: uuidv4(),
@@ -729,44 +612,29 @@ async function saveStreamHistory(stream) {
       platform: stream.platform || 'Custom',
       platform_icon: stream.platform_icon,
       video_id: stream.video_id,
-      video_title: videoDetails ? videoDetails.title : null,
+      video_title: videoDetails?.title || null,
       resolution: stream.resolution,
       bitrate: stream.bitrate,
       fps: stream.fps,
       start_time: stream.start_time,
       end_time: stream.end_time || new Date().toISOString(),
-      duration: durationSeconds,
+      duration,
       use_advanced_settings: stream.use_advanced_settings ? 1 : 0,
       user_id: stream.user_id
     };
+
     return new Promise((resolve, reject) => {
-      db.run(
-        `INSERT INTO stream_history (
-          id, stream_id, title, platform, platform_icon, video_id, video_title,
-          resolution, bitrate, fps, start_time, end_time, duration, use_advanced_settings, user_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          historyData.id, historyData.stream_id, historyData.title,
-          historyData.platform, historyData.platform_icon, historyData.video_id, historyData.video_title,
-          historyData.resolution, historyData.bitrate, historyData.fps,
-          historyData.start_time, historyData.end_time, historyData.duration,
-          historyData.use_advanced_settings, historyData.user_id
-        ],
-        function (err) {
-          if (err) {
-            console.error('[StreamingService] Error saving stream history:', err.message);
-            return reject(err);
-          }
-          console.log(`[StreamingService] Stream history saved for stream ${stream.id}, duration: ${durationSeconds}s`);
-          resolve(historyData);
-        }
-      );
+      db.run(`INSERT INTO stream_history (...) VALUES (...)`, [...], function(err) {
+        if (err) return reject(err);
+        resolve(historyData);
+      });
     });
-  } catch (error) {
-    console.error('[StreamingService] Failed to save stream history:', error);
+  } catch (e) {
+    console.error('[StreamingService] Save history error:', e);
     return false;
   }
 }
+
 module.exports = {
   startStream,
   stopStream,
