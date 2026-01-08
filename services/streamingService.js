@@ -10,11 +10,11 @@ const Playlist = require('../models/Playlist');
 
 // === DETEKSI ARSITEKTUR UNTUK OPTIMASI ARM32 ===
 const os = require('os');
-const isARM32 = os.arch() === 'arm' && os.totalmem() < 2 * 1024 * 1024 * 1024; // <2GB RAM → anggap ARM32 low-end
-console.log(`[StreamingService] Architecture: ${os.arch()}, Total RAM: ${(os.totalmem() / 1024 / 1024).toFixed(0)} MB, isARM32: ${isARM32}`);
+const isARM32 = os.arch() === 'arm' && os.totalmem() < 2 * 1024 * 1024 * 1024;
+console.log(`[StreamingService] Architecture: ${os.arch()}, RAM: ${(os.totalmem() / 1024 / 1024).toFixed(0)} MB, isARM32: ${isARM32}`);
 
 // === KONFIGURASI DEFAULT BERDASARKAN ARSITEKTUR ===
-const DEFAULT_BITRATE = isARM32 ? 1000 : 2500;        // kbps
+const DEFAULT_BITRATE = isARM32 ? 1000 : 2500;
 const DEFAULT_RESOLUTION = isARM32 ? '960x540' : '1280x720';
 const DEFAULT_FPS = isARM32 ? 25 : 30;
 const ENCODING_PRESET = isARM32 ? 'ultrafast' : 'veryfast';
@@ -33,7 +33,7 @@ const activeStreams = new Map();
 const streamLogs = new Map();
 const streamRetryCount = new Map();
 const streamLastSuccessTime = new Map();
-const MAX_RETRY_ATTEMPTS = isARM32 ? 5 : 10; // kurangi retry di ARM32
+const MAX_RETRY_ATTEMPTS = isARM32 ? 5 : 10;
 const RETRY_RESET_INTERVAL = 30 * 60 * 1000;
 const manuallyStoppingStreams = new Set();
 const MAX_LOG_LINES = 100;
@@ -132,7 +132,7 @@ async function buildFFmpegArgsForPlaylist(stream, playlist) {
   }
 
   let concatContent = '';
-  const loopLimit = isARM32 ? 10 : 1000; // batasi loop di ARM32
+  const loopLimit = isARM32 ? 10 : 1000;
   const actualLoop = stream.loop_video ? loopLimit : 1;
 
   for (let i = 0; i < actualLoop; i++) {
@@ -224,7 +224,7 @@ async function buildFFmpegArgs(stream) {
 
   const rtmpUrl = `${stream.rtmp_url.replace(/\/$/, '')}/${stream.stream_key}`;
   const loopOption = '-stream_loop';
-  const loopValue = stream.loop_video ? (isARM32 ? '5' : '-1') : '0'; // batasi loop di ARM32
+  const loopValue = stream.loop_video ? (isARM32 ? '5' : '-1') : '0';
 
   if (!stream.use_advanced_settings) {
     return [
@@ -287,7 +287,6 @@ async function startStream(streamId, isRetry = false) {
       return { success: false, error: 'Stream is already active' };
     }
 
-    // === BATAS STREAM AKTIF DI ARM32 ===
     if (isARM32 && activeStreams.size >= 1) {
       const msg = 'Only 1 concurrent stream allowed on ARM32 to prevent system overload';
       addStreamLog(streamId, msg);
@@ -463,7 +462,6 @@ async function stopStream(streamId) {
     if (ffmpegProcess && typeof ffmpegProcess.kill === 'function') {
       ffmpegProcess.kill('SIGTERM');
 
-      // Force kill after 5s if needed (penting di ARM32)
       setTimeout(() => {
         if (ffmpegProcess.exitCode === null) {
           try { ffmpegProcess.kill('SIGKILL'); } catch (e) {}
@@ -499,7 +497,6 @@ async function stopStream(streamId) {
   }
 }
 
-// === Fungsi lain tetap sama (sync, health check, dll) ===
 async function syncStreamStatuses() {
   try {
     const liveStreams = await Stream.findAll(null, 'live');
@@ -598,12 +595,17 @@ function getStreamLogs(streamId) {
 
 async function saveStreamHistory(stream) {
   try {
-    if (!stream.start_time) return false;
-    const start = new Date(stream.start_time);
-    const end = stream.end_time ? new Date(stream.end_time) : new Date();
-    const duration = Math.floor((end - start) / 1000);
-    if (duration < 1) return false;
-
+    if (!stream.start_time) {
+      console.log(`[StreamingService] Not saving history for stream ${stream.id} - no start time recorded`);
+      return false;
+    }
+    const startTime = new Date(stream.start_time);
+    const endTime = stream.end_time ? new Date(stream.end_time) : new Date();
+    const durationSeconds = Math.floor((endTime - startTime) / 1000);
+    if (durationSeconds < 1) {
+      console.log(`[StreamingService] Not saving history for stream ${stream.id} - duration too short (${durationSeconds}s)`);
+      return false;
+    }
     const videoDetails = stream.video_id ? await Video.findById(stream.video_id) : null;
     const historyData = {
       id: uuidv4(),
@@ -612,25 +614,42 @@ async function saveStreamHistory(stream) {
       platform: stream.platform || 'Custom',
       platform_icon: stream.platform_icon,
       video_id: stream.video_id,
-      video_title: videoDetails?.title || null,
+      video_title: videoDetails ? videoDetails.title : null,
       resolution: stream.resolution,
       bitrate: stream.bitrate,
       fps: stream.fps,
       start_time: stream.start_time,
       end_time: stream.end_time || new Date().toISOString(),
-      duration,
+      duration: durationSeconds,
       use_advanced_settings: stream.use_advanced_settings ? 1 : 0,
       user_id: stream.user_id
     };
 
     return new Promise((resolve, reject) => {
-      db.run(`INSERT INTO stream_history (...) VALUES (...)`, [...], function(err) {
-        if (err) return reject(err);
-        resolve(historyData);
-      });
+      db.run(
+        `INSERT INTO stream_history (
+          id, stream_id, title, platform, platform_icon, video_id, video_title,
+          resolution, bitrate, fps, start_time, end_time, duration, use_advanced_settings, user_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          historyData.id, historyData.stream_id, historyData.title,
+          historyData.platform, historyData.platform_icon, historyData.video_id, historyData.video_title,
+          historyData.resolution, historyData.bitrate, historyData.fps,
+          historyData.start_time, historyData.end_time, historyData.duration,
+          historyData.use_advanced_settings, historyData.user_id
+        ],
+        function (err) {
+          if (err) {
+            console.error('[StreamingService] Error saving stream history:', err.message);
+            return reject(err);
+          }
+          console.log(`[StreamingService] Stream history saved for stream ${stream.id}, duration: ${durationSeconds}s`);
+          resolve(historyData);
+        }
+      );
     });
-  } catch (e) {
-    console.error('[StreamingService] Save history error:', e);
+  } catch (error) {
+    console.error('[StreamingService] Failed to save stream history:', error);
     return false;
   }
 }
